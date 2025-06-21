@@ -1,92 +1,110 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Autentica no portal Faculdade Impacta (Edools)
-e devolve uma sessão pronta para uso.
+Autentica no portal Edools da Faculdade Impacta
+e grava cookies de sessão em `session_cookies.json`.
 
-Uso:
-    python login_facimpacta.py credenciais.json
+USO:
+    python login_facimpacta.py credenciais.json        # faz login e salva cookies
+    python login_facimpacta.py credenciais.json --fresh  # força novo login
+
+Formato de credenciais.json:
+{
+  "email":    "seu@email",
+  "password": "*******"
+}
 """
-
-import json
-import sys
+from __future__ import annotations
+import argparse, json, sys, time, urllib.parse as ul
 from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 
-
-LOGIN_URL = "https://faculdade-impacta.myedools.com/users/sign_in"
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-    )
+BASE_URL      = "https://faculdade-impacta.myedools.com"
+SIGN_IN_URL   = f"{BASE_URL}/users/sign_in"
+COOKIES_FILE  = Path("session_cookies.json")
+HEADERS       = {
+    "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
 }
 
 
-def carregar_credenciais(json_path: Path) -> tuple[str, str]:
-    with json_path.open(encoding="utf-8") as f:
-        data = json.load(f)
-    return data["email"], data["password"]
+# -------------------------------------------------------------------------
+# utilidades
+# -------------------------------------------------------------------------
+def salvar_sessao(sess: requests.Session, outfile: Path = COOKIES_FILE) -> None:
+    data = {
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "cookies":  sess.cookies.get_dict()
+    }
+    outfile.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def extrair_tokens(html: str) -> tuple[str, str]:
-    soup = BeautifulSoup(html, "html.parser")
-
-    csrf = soup.find("input", {"name": "authenticity_token"})
-    org_id = soup.find("input", {"name": "user[organization_id]"})
-
-    if not csrf or not org_id:
-        raise RuntimeError(
-            "Não foi possível localizar authenticity_token ou organization_id. "
-            "O HTML pode ter mudado ou o site pediu reCAPTCHA."
-        )
-
-    return csrf["value"], org_id["value"]
+def carregar_sessao(infile: Path = COOKIES_FILE) -> requests.Session | None:
+    """Reconstrói a sessão com os cookies salvos (ou None, se não existir)."""
+    if not infile.exists():
+        return None
+    data = json.loads(infile.read_text())
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    s.cookies.update(data["cookies"])
+    return s
 
 
-def login(email: str, password: str) -> requests.Session | None:
+# -------------------------------------------------------------------------
+# fluxo de login
+# -------------------------------------------------------------------------
+def login(cred_file: str | Path) -> requests.Session:
+    cred = json.loads(Path(cred_file).read_text(encoding="utf-8"))
+    email, password = cred["email"], cred["password"]
+
     sess = requests.Session()
+    sess.headers.update(HEADERS)
 
-    # 1) GET da página para capturar cookies + tokens ocultos
-    resp = sess.get(LOGIN_URL, headers=HEADERS, timeout=15)
-    resp.raise_for_status()
+    # --- 1) GET de /users/sign_in para obter authenticity_token ----------------
+    r = sess.get(SIGN_IN_URL, timeout=20)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    token_tag = soup.find("meta", attrs={"name": "csrf-token"})
+    authenticity_token = token_tag["content"] if token_tag else ""
 
-    authenticity_token, organization_id = extrair_tokens(resp.text)
-
-    # 2) POST de autenticação
+    # --- 2) POST para efetuar login -------------------------------------------
     payload = {
         "authenticity_token": authenticity_token,
-        "user[organization_id]": organization_id,
-        "user[email]": email,
-        "user[password]": password,
+        "user[organization_id]": "6352",
+        "user[email]":          email,
+        "user[password]":       password,
     }
 
-    post = sess.post(LOGIN_URL, data=payload, headers=HEADERS, timeout=15, allow_redirects=True)
+    resp = sess.post(SIGN_IN_URL, data=payload,
+                     allow_redirects=False, timeout=20)
 
-    # 3) Heurísticas simples de sucesso
-    if "Email e/ou senha inválidos" in post.text:
-        print("❌  Credenciais rejeitadas.")
-        return None
+    if resp.status_code not in (302, 303):
+        raise RuntimeError("❌  Falha no login – verifique email ou senha.")
 
-    if post.url.endswith("/users/sign_in"):
-        print("⚠️  Ainda na tela de login — provavelmente o site exigiu reCAPTCHA.")
-        return None
+    redirect_to = ul.urljoin(BASE_URL, resp.headers["Location"])
+    # segue o redirect só para conferir:
+    sess.get(redirect_to, timeout=20)
 
-    print("✅  Login bem-sucedido! Redirecionado para:", post.url)
+    salvar_sessao(sess)
+    print(f"✅  Login bem-sucedido! Redirecionado para: {redirect_to}")
     return sess
 
 
+# -------------------------------------------------------------------------
+# CLI simples
+# -------------------------------------------------------------------------
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print("Uso: python login_facimpacta.py credenciais.json")
-        sys.exit(1)
+    ap = argparse.ArgumentParser(
+        description="Faz login na Faculdade Impacta (Edools) e salva cookies."
+    )
+    ap.add_argument("credenciais", help="Arquivo JSON com email e password.")
+    ap.add_argument("--fresh", action="store_true",
+                    help="Ignora cookies existentes e força novo login.")
+    args = ap.parse_args()
 
-    json_file = Path(sys.argv[1])
-    email, pwd = carregar_credenciais(json_file)
-    session = login(email, pwd)
+    if not args.fresh and COOKIES_FILE.exists():
+        print("🔄  Cookies já salvos; use --fresh para refazer o login.")
+        sys.exit(0)
 
-    # Exemplo: acessar a home autenticada, caso o login tenha dado certo
-    if session:
-        r = session.get("https://faculdade-impacta.myedools.com/", headers=HEADERS, timeout=15)
-        print("Título da página inicial:", BeautifulSoup(r.text, "html.parser").title.string)
+    login(args.credenciais)
