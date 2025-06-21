@@ -1,102 +1,76 @@
 #!/usr/bin/env python3
 """
-Faz login no portal myedools/Faculdade Impacta e salva os
-cookies de sessão em `session_cookies.json`.
+Faz login na plataforma Edools / Impacta e grava os cookies em
+`session_cookies.json`.  Usa apenas `requests`, então não precisa
+de navegador nenhum.
 
-Uso
-----
-python login_facimpacta.py credenciais.json            # reaproveita cookies
-python login_facimpacta.py credenciais.json --fresh    # força novo login
+$ python login_facimpacta.py credenciais.json          # usa cache
+$ python login_facimpacta.py credenciais.json --fresh  # força novo login
 """
 from __future__ import annotations
-
-import argparse
-import json
-import pathlib
-import sys
-from datetime import datetime
-
+import argparse, pathlib, json, sys, re
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup as BS
 
-BASE_URL = "https://faculdade-impacta.myedools.com"
-LOGIN_URL = f"{BASE_URL}/users/sign_in"
-COOKIES_FILE = pathlib.Path("session_cookies.json")
+LOGIN_URL     = "https://faculdade-impacta.myedools.com/users/sign_in"
+COOKIES_FILE  = pathlib.Path("session_cookies.json")
+HEADERS       = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
 
+def _extrai_token(html: str) -> str:
+    soup = BS(html, "html.parser")
+    tag  = soup.find("meta", attrs={"name": "csrf-token"})
+    if not tag:
+        raise RuntimeError("authenticity_token não encontrado.")
+    return tag["content"]
 
-# ───────── helpers ────────────────────────────────────────────────────────────
-def _carregar_credenciais(path: pathlib.Path) -> tuple[str, str]:
-    data = json.loads(path.read_text(encoding="utf-8"))
-    try:
-        email = data["email"]
-        senha = data.get("senha") or data["password"]  # aceita ambas
-    except KeyError as exc:
-        raise KeyError(
-            'O arquivo deve conter as chaves "email" e "password" (ou "senha").'
-        ) from exc
-    return email, senha
-
-
-def _salvar_cookies(sess: requests.Session) -> None:
-    payload = {
-        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "cookies": requests.utils.dict_from_cookiejar(sess.cookies),
-    }
-    COOKIES_FILE.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
-
-
-def _carregar_cookies(sess: requests.Session) -> None:
-    raw = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
-    sess.cookies = requests.utils.cookiejar_from_dict(raw.get("cookies", raw))
-
-
-def _login(sess: requests.Session, email: str, senha: str) -> str:
-    """Efetua login e devolve a URL final (ex.: /enrollments)."""
-    r = sess.get(LOGIN_URL, timeout=15)
-    r.raise_for_status()
-    csrf = BeautifulSoup(r.text, "html.parser").find(
-        "meta", attrs={"name": "csrf-token"}
-    )["content"]
+def login(sess: requests.Session, email: str, senha: str) -> str:
+    """Efetua o POST no endpoint de login e devolve a URL de destino."""
+    r = sess.get(LOGIN_URL, timeout=20, headers=HEADERS)
+    token = _extrai_token(r.text)
 
     payload = {
-        "authenticity_token": csrf,
-        "user[email]": email,
+        "user[email]"   : email,
         "user[password]": senha,
-        "user[organization_id]": "6352",
+        "authenticity_token": token,
+        "user[remember_me]": "0",
     }
-    r = sess.post(LOGIN_URL, data=payload, timeout=15, allow_redirects=False)
-    r.raise_for_status()
+    resp = sess.post(LOGIN_URL, data=payload,
+                     allow_redirects=False, headers=HEADERS)
 
-    destino = r.headers.get("location")
-    if not destino:
-        raise RuntimeError("Login falhou – verifique e-mail e senha.")
+    if resp.status_code not in (302, 303):
+        raise RuntimeError("Falha no login – verifique credenciais.")
 
-    sess.get(destino, timeout=15)          # finaliza redirecionamento
-    return destino
+    dest = resp.headers["Location"]
+    return dest
 
-
-# ───────── main ───────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("credenciais_json", type=pathlib.Path)
+    ap.add_argument("credenciais", type=pathlib.Path)
     ap.add_argument("--fresh", action="store_true",
-                    help="ignora cookies salvos e faz login novamente")
+                    help="ignora cookies salvos e faz login de novo")
     args = ap.parse_args()
 
-    email, senha = _carregar_credenciais(args.credenciais_json)
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
 
-    with requests.Session() as sess:
-        if COOKIES_FILE.exists() and not args.fresh:
-            _carregar_cookies(sess)
-            print("🔄  Cookies já salvos; use --fresh para refazer o login.")
-        else:
-            destino = _login(sess, email, senha)
-            _salvar_cookies(sess)
-            print(f"✅  Login bem-sucedido! Redirecionado para: {destino}")
+    if COOKIES_FILE.exists() and not args.fresh:
+        print("🔄  Cookies já salvos; use --fresh para refazer o login.")
+        data = json.loads(COOKIES_FILE.read_text())
+        sess.cookies.update(data["cookies"])
+        return
 
+    creds = json.loads(args.credenciais.read_text())
+    email = creds.get("email") or creds.get("usuario")
+    senha = creds.get("senha") or creds.get("password")
+    if not (email and senha):
+        print("Arquivo de credenciais deve ter 'email' e 'senha'",
+              file=sys.stderr)
+        sys.exit(1)
+
+    destino = login(sess, email, senha)
+    COOKIES_FILE.write_text(json.dumps({"cookies": sess.cookies.get_dict()},
+                                       ensure_ascii=False, indent=2))
+    print(f"✅  Login bem-sucedido! Redirecionado para: {destino}")
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        print("Uso: python login_facimpacta.py credenciais.json")
-        sys.exit(1)
     main()

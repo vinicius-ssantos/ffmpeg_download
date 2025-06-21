@@ -1,133 +1,76 @@
 #!/usr/bin/env python3
 """
-Extrai todos os links das aulas de um curso da Faculdade Impacta
-(Edools/HeroSpark).
+Coleta todos os links das aulas de um curso Edools/Impacta usando Playwright.
 
-Fluxo:
-1) tenta raspar o HTML estático;
-2) se não achar, usa Selenium (headless) reutilizando os cookies salvos.
+Pré-requisitos (uma única vez):
+    pip install playwright==1.*
+    python -m playwright install    # baixa o Chromium headless
 
-Requisitos:
-pip install requests beautifulsoup4 selenium webdriver-manager
+Uso:
+    python coletar_aulas.py https://.../enrollments/1234/courses/5678 \
+           --out lessons.json
 """
 from __future__ import annotations
-
-import argparse
-import json
-import os
-import pathlib
-import re
-import time
-
+import argparse, json, pathlib, re, sys
 import requests
-from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-# ───────── Selenium ──────────────────────────────────────────────────────────
-from selenium import webdriver
-from selenium.common.exceptions import WebDriverException
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
-# ─────────────────────────────────────────────────────────────────────────────
+BASE = "https://faculdade-impacta.myedools.com"
+RX_PATH = re.compile(r'/enrollments/\d+/courses/\d+/course_contents/\d+')
 
-BASE_URL = "https://faculdade-impacta.myedools.com"
 COOKIES_FILE = pathlib.Path("session_cookies.json")
-REGEX_AULA = re.compile(r"/enrollments/\d+/courses/\d+/course_contents/\d+")
+HEADERS      = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"}
 
 
-# ───────── helpers ────────────────────────────────────────────────────────────
-def _sessao() -> requests.Session:
+def _add_cookies_to_context(ctx, cookies_dict: dict[str, str]) -> None:
+    """Injeta cookies de sessão já autenticada no contexto Playwright."""
+    cookies = [{
+        "name"   : k,
+        "value"  : v,
+        "domain" : "faculdade-impacta.myedools.com",
+        "path"   : "/",
+        "httpOnly": False,
+        "secure"  : True,
+        "sameSite": "Lax"
+    } for k, v in cookies_dict.items()]
+    ctx.add_cookies(cookies)
+
+
+def coleta_links(course_url: str) -> list[str]:
+    """Abre a página via Playwright e extrai os paths das aulas."""
     if not COOKIES_FILE.exists():
-        raise FileNotFoundError(
-            "session_cookies.json não encontrado. Execute login_facimpacta.py --fresh."
-        )
-    raw = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
-    sess = requests.Session()
-    sess.cookies = requests.utils.cookiejar_from_dict(raw.get("cookies", raw))
-    return sess
+        sys.exit("⚠️  Você precisa fazer login primeiro (session_cookies.json).")
+
+    cookies = json.loads(COOKIES_FILE.read_text())["cookies"]
+
+    with sync_playwright() as p:
+        browser  = p.chromium.launch(headless=True)
+        context  = browser.new_context()
+        _add_cookies_to_context(context, cookies)
+
+        page = context.new_page()
+        page.goto(course_url, wait_until="networkidle")
+        html = page.content()
+
+        paths = {m.group(0) for m in RX_PATH.finditer(html)}
+        if not paths:
+            raise RuntimeError("Nenhum link encontrado – verifique a URL ou o curso.")
+
+        return [f"{BASE}{path}" for path in sorted(paths)]
 
 
-def _extrair_links(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = {a["href"] for a in soup.find_all("a", href=True)
-             if REGEX_AULA.fullmatch(a["href"])}
-    return sorted(f"{BASE_URL}{href}" for href in links)
-
-
-def _raspar_com_selenium(cookies: dict, url: str) -> list[str]:
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--window-size=1920,1080")
-
-    # 1) tenta usar driver fornecido pelo usuário
-    driver_path = os.getenv("CHROMEDRIVER")               # caminho manual
-    if driver_path and not pathlib.Path(driver_path).exists():
-        raise FileNotFoundError(f"CHROMEDRIVER='{driver_path}' não existe.")
-
-    try:
-        if not driver_path:
-            driver_path = ChromeDriverManager().install()
-
-        service = Service(driver_path)
-        driver = webdriver.Chrome(service=service, options=opts)
-    except (OSError, WebDriverException) as exc:
-        raise RuntimeError(
-            "Falha ao iniciar o ChromeDriver — normalmente é sinal de "
-            "incompatibilidade de arquitetura ou versão. "
-            "Baixe manualmente o executável adequado ao seu Chrome "
-            "e defina a variável de ambiente CHROMEDRIVER com o caminho completo."
-        ) from exc
-
-    try:
-        driver.get("about:blank")
-        for k, v in cookies.items():
-            driver.add_cookie({"name": k, "value": v,
-                               "domain": "faculdade-impacta.myedools.com",
-                               "path": "/"})
-        driver.get(url)
-        time.sleep(3)                                     # aguarda JS
-        return _extrair_links(driver.page_source)
-    finally:
-        driver.quit()
-
-
-# ───────── fluxo principal ───────────────────────────────────────────────────
-def coletar_aulas(course_url: str, destino: pathlib.Path) -> None:
-    sess = _sessao()
-
-    # 1) HTML estático
-    r = sess.get(course_url, timeout=20)
-    if r.is_redirect:
-        raise RuntimeError("Sessão expirada – refaça o login com --fresh.")
-
-    r.raise_for_status()
-    aulas = _extrair_links(r.text)
-
-    if aulas:
-        print(f"✅  {len(aulas)} links encontrados no HTML estático.")
-    else:
-        print("🔍  Nenhum link encontrado – usando Selenium…")
-        aulas = _raspar_com_selenium(sess.cookies.get_dict(), course_url)
-        print(f"✅  {len(aulas)} links coletados via Selenium.")
-
-    if not aulas:
-        raise RuntimeError("Nenhum link detectado. O layout do site pode ter mudado.")
-
-    destino.write_text(json.dumps(aulas, indent=2, ensure_ascii=False))
-    print(f"💾  Links salvos em: {destino.resolve()}")
-
-
-# ───────── CLI ───────────────────────────────────────────────────────────────
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("course_url", help="URL completa do curso (/courses/ID).")
-    ap.add_argument("--out", default="lessons.json",
-                    help="Arquivo JSON de saída (padrão: lessons.json)")
+    ap.add_argument("course_url")
+    ap.add_argument("--out", "-o", default="lessons.json",
+                    help="arquivo de saída (padrão: lessons.json)")
     args = ap.parse_args()
 
-    coletar_aulas(args.course_url, pathlib.Path(args.out))
+    links = coleta_links(args.course_url)
+    pathlib.Path(args.out).write_text(
+        json.dumps(links, indent=2, ensure_ascii=False)
+    )
+    print(f"✅  {len(links)} links salvos em {args.out}")
 
 
 if __name__ == "__main__":
