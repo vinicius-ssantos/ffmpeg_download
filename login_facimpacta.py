@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
 Faz login no portal myedools/Faculdade Impacta e salva os
-cookies de sessão num arquivo JSON (`session_cookies.json`).
+cookies de sessão em `session_cookies.json`.
 
-Exemplos
---------
-# usa cookies em cache (se existirem)
-python login_facimpacta.py credenciais.json
-
-# força login novamente
-python login_facimpacta.py credenciais.json --fresh
+Uso
+----
+python login_facimpacta.py credenciais.json            # reaproveita cookies
+python login_facimpacta.py credenciais.json --fresh    # força novo login
 """
 from __future__ import annotations
 
@@ -32,11 +29,10 @@ def _carregar_credenciais(path: pathlib.Path) -> tuple[str, str]:
     data = json.loads(path.read_text(encoding="utf-8"))
     try:
         email = data["email"]
-        senha = data.get("senha") or data["password"]  # aceita ambos
+        senha = data.get("senha") or data["password"]  # aceita ambas
     except KeyError as exc:
         raise KeyError(
-            "Arquivo de credenciais deve conter as chaves "
-            '"email" e "password" (ou "senha").'
+            'O arquivo deve conter as chaves "email" e "password" (ou "senha").'
         ) from exc
     return email, senha
 
@@ -51,20 +47,17 @@ def _salvar_cookies(sess: requests.Session) -> None:
 
 def _carregar_cookies(sess: requests.Session) -> None:
     raw = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
-    cookies_dict = raw.get("cookies", raw)  # lida com os dois formatos
-    sess.cookies = requests.utils.cookiejar_from_dict(cookies_dict)
+    sess.cookies = requests.utils.cookiejar_from_dict(raw.get("cookies", raw))
 
 
 def _login(sess: requests.Session, email: str, senha: str) -> str:
-    """Efetua login e devolve a URL final (enrollments)."""
-    # 1) token CSRF
+    """Efetua login e devolve a URL final (ex.: /enrollments)."""
     r = sess.get(LOGIN_URL, timeout=15)
     r.raise_for_status()
     csrf = BeautifulSoup(r.text, "html.parser").find(
         "meta", attrs={"name": "csrf-token"}
     )["content"]
 
-    # 2) submit
     payload = {
         "authenticity_token": csrf,
         "user[email]": email,
@@ -74,12 +67,11 @@ def _login(sess: requests.Session, email: str, senha: str) -> str:
     r = sess.post(LOGIN_URL, data=payload, timeout=15, allow_redirects=False)
     r.raise_for_status()
 
-    # 3) segue redirecionamento manualmente
     destino = r.headers.get("location")
     if not destino:
         raise RuntimeError("Login falhou – verifique e-mail e senha.")
 
-    sess.get(destino, timeout=15)
+    sess.get(destino, timeout=15)          # finaliza redirecionamento
     return destino
 
 
@@ -88,7 +80,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("credenciais_json", type=pathlib.Path)
     ap.add_argument("--fresh", action="store_true",
-                    help="ignora cache de cookies e faz login novamente")
+                    help="ignora cookies salvos e faz login novamente")
     args = ap.parse_args()
 
     email, senha = _carregar_credenciais(args.credenciais_json)
